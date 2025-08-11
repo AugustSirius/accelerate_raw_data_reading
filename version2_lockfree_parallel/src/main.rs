@@ -87,8 +87,8 @@ fn process_frame_worker(
     sender: Sender<ProcessedFrame>,
 ) {
     let frame = match frames.get(frame_idx) {
-        Some(f) => f,
-        None => return,
+        Ok(f) => f,
+        Err(_) => return,
     };
     
     let rt_min = frame.rt_in_seconds as f32 / 60.0;
