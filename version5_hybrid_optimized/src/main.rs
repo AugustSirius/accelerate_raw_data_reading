@@ -3,12 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use timsrust::{converters::ConvertableDomain, readers::{FrameReader, MetadataReader}, MSLevel};
+use timsrust::{converters::{ConvertableDomain, Tof2MzConverter, Scan2ImConverter}, readers::{FrameReader, MetadataReader}, MSLevel};
 use rayon::prelude::*;
 use dashmap::DashMap;
 use bumpalo::Bump;
 use mimalloc::MiMalloc;
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::bounded;
 use parking_lot::Mutex;
 
 #[global_allocator]
@@ -160,13 +160,12 @@ fn find_scan_binary_unsafe(index: usize, scan_offsets: &[usize]) -> usize {
     }
 }
 
-struct FrameProcessor<'a> {
-    arena: &'a Bump,
-    mz_cv: Arc<dyn ConvertableDomain>,
-    im_cv: Arc<dyn ConvertableDomain>,
+struct FrameProcessor {
+    mz_cv: Arc<Tof2MzConverter>,
+    im_cv: Arc<Scan2ImConverter>,
 }
 
-impl<'a> FrameProcessor<'a> {
+impl FrameProcessor {
     #[inline(always)]
     fn process_peaks_batch(
         &self,
@@ -230,7 +229,7 @@ fn estimate_total_peaks(frames: &FrameReader) -> (usize, usize) {
     let mut ms2_count = 0;
     
     for idx in 0..sample_size {
-        if let Some(frame) = frames.get(idx) {
+        if let Ok(frame) = frames.get(idx) {
             match frame.ms_level {
                 MSLevel::MS1 => {
                     ms1_sum += frame.tof_indices.len();
@@ -314,16 +313,14 @@ pub fn read_timstof_data(d_folder: &Path) -> Result<TimsTOFRawData, Box<dyn Erro
     });
     
     (0..n_frames).into_par_iter().for_each(|idx| {
-        let arena = Bump::with_capacity(ARENA_SIZE);
         let processor = FrameProcessor {
-            arena: &arena,
             mz_cv: Arc::clone(&mz_cv),
             im_cv: Arc::clone(&im_cv),
         };
         
         let frame = match frames.get(idx) {
-            Some(f) => f,
-            None => return,
+            Ok(f) => f,
+            Err(_) => return,
         };
         
         let rt_min = frame.rt_in_seconds as f32 / 60.0;
