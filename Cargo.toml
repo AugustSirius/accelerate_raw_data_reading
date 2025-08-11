@@ -1,13 +1,26 @@
 [package]
-name = "accelerate_raw_data_reading"
+name = "timstof-reader"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 timsrust = "0.4"
 rayon = "1.7"
+parking_lot = "0.12"
+crossbeam = "0.8"
+num_cpus = "1.16"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+
+[profile.bench]
+inherits = "release"
+debug = true
