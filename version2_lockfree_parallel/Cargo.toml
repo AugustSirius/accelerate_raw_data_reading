@@ -1,0 +1,23 @@
+[package]
+name = "timstof-loader-v2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+timsrust = "0.4"
+rayon = "1.7"
+dashmap = "5.5"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.release.build-override]
+opt-level = 3

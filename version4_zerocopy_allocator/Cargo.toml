@@ -1,0 +1,21 @@
+[package]
+name = "timstof-loader-v4"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+timsrust = "0.4"
+rayon = "1.7"
+bumpalo = "3.14"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.release.build-override]
+opt-level = 3
