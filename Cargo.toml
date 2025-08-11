@@ -5,22 +5,16 @@ edition = "2021"
 
 [dependencies]
 timsrust = "0.4"
-rayon = "1.7"
-parking_lot = "0.12"
-crossbeam = "0.8"
+rayon = "1.10"
 num_cpus = "1.16"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
 
-[profile.release-lto]
-inherits = "release"
-lto = "fat"
-
-[profile.bench]
-inherits = "release"
-debug = true
+# Enable native CPU optimizations
+[build]
+rustflags = ["-C", "target-cpu=native"]
