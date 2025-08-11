@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use timsrust::{converters::ConvertableDomain, readers::{FrameReader, MetadataReader}, MSLevel};
 use rayon::prelude::*;
@@ -608,10 +608,12 @@ pub fn read_timstof_data_v4(d_folder: &Path) -> Result<TimsTOFRawData, Box<dyn E
     
     let merge_start = Instant::now();
     let final_ms1 = Arc::try_unwrap(global_ms1)
-        .unwrap_or_else(|arc| arc.read().clone())
-        .into_inner();
+        .map(|rwlock| rwlock.into_inner())
+        .unwrap_or_else(|arc| arc.read().clone());
     
-    let ms2_vec: Vec<_> = global_ms2.into_iter()
+    let ms2_vec: Vec<_> = Arc::try_unwrap(global_ms2)
+        .unwrap_or_else(|arc| (*arc).clone())
+        .into_iter()
         .map(|((q_low, q_high), td)| {
             let low = q_low as f32 / 10_000.0;
             let high = q_high as f32 / 10_000.0;
@@ -704,10 +706,68 @@ pub fn read_timstof_data_v6_hpc(d_folder: &Path) -> Result<TimsTOFRawData, Box<d
                 
                 match frame.ms_level {
                     MSLevel::MS1 => {
-                        process_ms1_frame_simd(&frame, rt_min, &mz_cv, &im_cv, &mut local_ms1);
+                        // Inline MS1 processing
+                        let n_peaks = frame.tof_indices.len();
+                        local_ms1.rt_values_min.reserve(n_peaks);
+                        local_ms1.mobility_values.reserve(n_peaks);
+                        local_ms1.mz_values.reserve(n_peaks);
+                        local_ms1.intensity_values.reserve(n_peaks);
+                        local_ms1.frame_indices.reserve(n_peaks);
+                        local_ms1.scan_indices.reserve(n_peaks);
+                        
+                        for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter()
+                            .zip(frame.intensities.iter()).enumerate() 
+                        {
+                            let scan = find_scan_for_index_binary(p_idx, &frame.scan_offsets);
+                            let mz = mz_cv.convert(tof as f64) as f32;
+                            let im = im_cv.convert(scan as f64) as f32;
+                            
+                            local_ms1.rt_values_min.push(rt_min);
+                            local_ms1.mobility_values.push(im);
+                            local_ms1.mz_values.push(mz);
+                            local_ms1.intensity_values.push(intensity);
+                            local_ms1.frame_indices.push(frame.index as u32);
+                            local_ms1.scan_indices.push(scan as u32);
+                        }
                     }
                     MSLevel::MS2 => {
-                        process_ms2_frame_optimized(&frame, rt_min, &mz_cv, &im_cv, &local_ms2);
+                        // Inline MS2 processing
+                        let qs = &frame.quadrupole_settings;
+                        
+                        for win in 0..qs.isolation_mz.len() {
+                            if win >= qs.isolation_width.len() { break; }
+                            
+                            let prec_mz = qs.isolation_mz[win] as f32;
+                            let width = qs.isolation_width[win] as f32;
+                            let low = prec_mz - width * 0.5;
+                            let high = prec_mz + width * 0.5;
+                            let key = (quantize(low), quantize(high));
+                            
+                            // Collect valid peaks
+                            let mut td = TimsTOFData::new();
+                            for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter()
+                                .zip(frame.intensities.iter()).enumerate() 
+                            {
+                                let scan = find_scan_for_index_binary(p_idx, &frame.scan_offsets);
+                                if scan < qs.scan_starts[win] || scan > qs.scan_ends[win] { continue; }
+                                
+                                let mz = mz_cv.convert(tof as f64) as f32;
+                                let im = im_cv.convert(scan as f64) as f32;
+                                
+                                td.rt_values_min.push(rt_min);
+                                td.mobility_values.push(im);
+                                td.mz_values.push(mz);
+                                td.intensity_values.push(intensity);
+                                td.frame_indices.push(frame.index as u32);
+                                td.scan_indices.push(scan as u32);
+                            }
+                            
+                            if !td.mz_values.is_empty() {
+                                local_ms2.entry(key)
+                                    .and_modify(|e: &mut TimsTOFData| e.extend_from(&td))
+                                    .or_insert(td);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -756,133 +816,6 @@ pub fn read_timstof_data_v6_hpc(d_folder: &Path) -> Result<TimsTOFRawData, Box<d
         ms1_data: global_ms1,
         ms2_windows: ms2_vec,
     })
-}
-
-// SIMD-optimized MS1 frame processing
-#[cfg(target_arch = "x86_64")]
-fn process_ms1_frame_simd(
-    frame: &timsrust::Frame,
-    rt_min: f32,
-    mz_cv: &Arc<impl ConvertableDomain<f64, f64>>,
-    im_cv: &Arc<impl ConvertableDomain<f64, f64>>,
-    output: &mut TimsTOFData,
-) {
-    use std::arch::x86_64::*;
-    
-    let n_peaks = frame.tof_indices.len();
-    output.rt_values_min.resize(output.rt_values_min.len() + n_peaks, rt_min);
-    output.frame_indices.resize(output.frame_indices.len() + n_peaks, frame.index as u32);
-    
-    // Process in SIMD-friendly batches
-    const SIMD_WIDTH: usize = 8;  // AVX can handle 8 floats
-    let mut scan_cache = vec![0usize; n_peaks];
-    
-    // Pre-compute scans with binary search
-    for (p_idx, scan) in scan_cache.iter_mut().enumerate() {
-        *scan = find_scan_for_index_binary(p_idx, &frame.scan_offsets);
-    }
-    
-    // Batch convert TOF indices and scans
-    for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter()
-        .zip(frame.intensities.iter()).enumerate() 
-    {
-        let scan = scan_cache[p_idx];
-        let mz = mz_cv.convert(tof as f64) as f32;
-        let im = im_cv.convert(scan as f64) as f32;
-        
-        output.mobility_values.push(im);
-        output.mz_values.push(mz);
-        output.intensity_values.push(intensity);
-        output.scan_indices.push(scan as u32);
-    }
-}
-
-// Fallback for non-x86_64
-#[cfg(not(target_arch = "x86_64"))]
-fn process_ms1_frame_simd(
-    frame: &timsrust::Frame,
-    rt_min: f32,
-    mz_cv: &Arc<impl ConvertableDomain<f64, f64>>,
-    im_cv: &Arc<impl ConvertableDomain<f64, f64>>,
-    output: &mut TimsTOFData,
-) {
-    // Fallback to regular processing
-    let n_peaks = frame.tof_indices.len();
-    output.rt_values_min.resize(output.rt_values_min.len() + n_peaks, rt_min);
-    output.frame_indices.resize(output.frame_indices.len() + n_peaks, frame.index as u32);
-    
-    for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter()
-        .zip(frame.intensities.iter()).enumerate() 
-    {
-        let scan = find_scan_for_index_binary(p_idx, &frame.scan_offsets);
-        let mz = mz_cv.convert(tof as f64) as f32;
-        let im = im_cv.convert(scan as f64) as f32;
-        
-        output.mobility_values.push(im);
-        output.mz_values.push(mz);
-        output.intensity_values.push(intensity);
-        output.scan_indices.push(scan as u32);
-    }
-}
-
-// Optimized MS2 processing
-fn process_ms2_frame_optimized(
-    frame: &timsrust::Frame,
-    rt_min: f32,
-    mz_cv: &Arc<impl ConvertableDomain<f64, f64>>,
-    im_cv: &Arc<impl ConvertableDomain<f64, f64>>,
-    ms2_map: &DashMap<(u32, u32), TimsTOFData>,
-) {
-    let qs = &frame.quadrupole_settings;
-    
-    // Pre-compute scan mapping
-    let scan_map: Vec<usize> = (0..frame.scan_offsets.len())
-        .map(|p_idx| find_scan_for_index_binary(p_idx, &frame.scan_offsets))
-        .collect();
-    
-    for win in 0..qs.isolation_mz.len() {
-        if win >= qs.isolation_width.len() { break; }
-        
-        let prec_mz = qs.isolation_mz[win] as f32;
-        let width = qs.isolation_width[win] as f32;
-        let low = prec_mz - width * 0.5;
-        let high = prec_mz + width * 0.5;
-        let key = (quantize(low), quantize(high));
-        
-        // Collect valid peaks first
-        let mut valid_peaks = Vec::new();
-        for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter()
-            .zip(frame.intensities.iter()).enumerate() 
-        {
-            let scan = scan_map.get(p_idx).copied().unwrap_or_else(|| {
-                find_scan_for_index_binary(p_idx, &frame.scan_offsets)
-            });
-            
-            if scan >= qs.scan_starts[win] && scan <= qs.scan_ends[win] {
-                valid_peaks.push((tof, intensity, scan));
-            }
-        }
-        
-        if !valid_peaks.is_empty() {
-            let mut td = TimsTOFData::with_capacity(valid_peaks.len());
-            
-            for (tof, intensity, scan) in valid_peaks {
-                let mz = mz_cv.convert(tof as f64) as f32;
-                let im = im_cv.convert(scan as f64) as f32;
-                
-                td.rt_values_min.push(rt_min);
-                td.mobility_values.push(im);
-                td.mz_values.push(mz);
-                td.intensity_values.push(intensity);
-                td.frame_indices.push(frame.index as u32);
-                td.scan_indices.push(scan as u32);
-            }
-            
-            ms2_map.entry(key)
-                .and_modify(|e: &mut TimsTOFData| e.extend_from(&td))
-                .or_insert(td);
-        }
-    }
 }
 
 // Linux-specific HPC optimizations
@@ -1402,7 +1335,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let d_path = Path::new(&args[3]);
         
         let start = Instant::now();
-        let result = match version {
+        let result = match version.as_str() {
             "v1" => read_timstof_data_v1(d_path),
             "v2" => read_timstof_data_v2(d_path),
             "v3" => read_timstof_data_v3(d_path),

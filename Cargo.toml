@@ -1,5 +1,5 @@
 [package]
-name = "timstof-reader"
+name = "timstof-loader"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,6 +9,11 @@ rayon = "1.7"
 dashmap = "5.5"
 parking_lot = "0.12"
 
+# Optional: Use jemalloc for better memory management on Linux
+# Uncomment the line below if you want to use jemalloc
+# [target.'cfg(target_os = "linux")'.dependencies]
+# jemallocator = "0.5"
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -16,3 +21,13 @@ codegen-units = 1
 panic = "abort"
 strip = true
 debug = false
+
+[profile.release.build-override]
+opt-level = 3
+
+# Optional: Create a separate profile for maximum HPC performance
+# Build with: cargo build --profile release-hpc
+[profile.release-hpc]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
